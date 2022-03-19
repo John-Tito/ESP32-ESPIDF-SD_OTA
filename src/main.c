@@ -7,12 +7,14 @@
 
 // This example uses SPI peripheral to communicate with SD card.
 
+#include <dirent.h>
 #include <pins_arduino.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 #include "driver/gpio.h"
+#include "driver/sdmmc_host.h"
 #include "esp_ota_ops.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -26,7 +28,7 @@ static const char* PROJECT_NAME = "sdOTA";
 #define TEST_DIR "/test"
 #define FIRMWARE_DIR "/firmware"
 
-sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 sdmmc_card_t* card;
 
 #define MAX_BUF_SIZE 1024
@@ -49,44 +51,29 @@ void USER_ESP_LOGI(const char* tag, const char* fmt, ...) {
     printf("%s:%s\r\n", tag, buf);
     va_end(ap);
 }
+void readFileList(const char* basePath);
 
 esp_err_t sdcard_init() {
     esp_err_t ret;
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED,
         .max_files = 5,
         .allocation_unit_size = 16 * 1024};
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
 
     USER_ESP_LOGI(PROJECT_NAME, "Initializing SD card\n");
 
-    // Use settings defined above to initialize SD card and mount FAT filesystem.
-    // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
-    // Please check its source code and implement error recovery when developing
-    // production applications.
-    USER_ESP_LOGI(PROJECT_NAME, "Using SPI peripheral\n");
+    // 设置上拉
+    USER_ESP_LOGI(PROJECT_NAME, "Using SDMMC peripheral\n");
+    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);  // CMD, needed in 4- and 1- line modes
+    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);   // D0, needed in 4- and 1-line modes
+    gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);   // D1, needed in 4-line mode only
+    gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);  // D2, needed in 4-line mode only
+    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);  // D3, needed in 4- and 1-line modes
 
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
-    if (ret != ESP_OK) {
-        USER_ESP_LOGI(PROJECT_NAME, "Failed to initialize bus.\n");
-        return -1;
-    }
-
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = host.slot;
-
+    // 挂载文件系统
     USER_ESP_LOGI(PROJECT_NAME, "Mounting filesystem\n");
-    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
 
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
@@ -96,27 +83,25 @@ esp_err_t sdcard_init() {
         }
         return -1;
     }
+
     USER_ESP_LOGI(PROJECT_NAME, "Filesystem mounted\n");
 
-    // Card has been initialized, print its properties
+    // 打印SD卡信息
     sdmmc_card_print_info(stdout, card);
     return 0;
 }
 
 void sdcard_deinit() {
-    // All done, unmount partition and disable SPI peripheral
+    // 取消挂载文件系统
     esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
     USER_ESP_LOGI(PROJECT_NAME, "Card unmounted\n");
-
-    //deinitialize the bus after all devices are removed
-    spi_bus_free(host.slot);
 }
 
 esp_err_t sdcard_test() {
     const char* file_hello = MOUNT_POINT TEST_DIR "/hello.txt";
     const char* file_foo = MOUNT_POINT TEST_DIR "/foo.txt";
     FILE* f;
-    struct stat st;
+    struct stat info;
     char line[64];
 
     // First create a file.
@@ -131,7 +116,7 @@ esp_err_t sdcard_test() {
     USER_ESP_LOGI(PROJECT_NAME, "File written\n");
 
     // Check if destination file exists before renaming
-    if (stat(file_foo, &st) == 0) {
+    if (stat(file_foo, &info) == 0) {
         unlink(file_foo);  // Delete it if it exists
     }
 
@@ -170,24 +155,24 @@ esp_err_t sdcard_ota() {
     const char* fimware_file = MOUNT_POINT FIRMWARE_DIR "/update.bin";
     esp_err_t err = ESP_OK;
     FILE* f;
-    struct stat st;
+    struct stat info;
     char* line;
     esp_ota_handle_t update_handle = 0;
     const esp_partition_t* update_partition = NULL;
     int size_line = 0, size_sum = 0;
 
     //检查是否为文件
-    if (stat(fimware_file, &st) != 0) {
+    if (stat(fimware_file, &info) != 0) {
         USER_ESP_LOGI(PROJECT_NAME, "firmware doesn't exit\n");
         return -1;
     }
 
-    if (S_IFDIR & st.st_mode) {
+    if (S_IFDIR & info.st_mode) {
         USER_ESP_LOGI(PROJECT_NAME, "is folder\n");
         return -1;
     }
 
-    if (S_IFREG & st.st_mode) {
+    if (S_IFREG & info.st_mode) {
         /* 打开文件 */
         f = fopen(fimware_file, "rb");
         if (f == NULL) {
@@ -214,7 +199,7 @@ esp_err_t sdcard_ota() {
         }
 
         /* 检查文件大小与读取字节数是否一致 */
-        if (size_sum != st.st_size) {
+        if (size_sum != info.st_size) {
             USER_ESP_LOGI(PROJECT_NAME, "file size err\n");
             esp_ota_abort(update_handle);
             return -1;
@@ -246,7 +231,10 @@ esp_err_t sdcard_ota() {
 void app_main(void) {
     esp_err_t ret;
     const char* need_update_file = MOUNT_POINT "/boot_cnt";
-    struct stat st;
+    struct stat info;
+    DIR* dir;
+    struct dirent* ptr;
+    char base[128];
 
     vTaskDelay(5000 / portTICK_PERIOD_MS);
 
@@ -260,7 +248,27 @@ void app_main(void) {
         return;
     }
 
-    if (stat(need_update_file, &st) == 0) {
+    dir = opendir(MOUNT_POINT);
+    if (dir == NULL) {
+        printf("Open dir:%s error...", MOUNT_POINT);
+        return;
+    }
+
+    while ((ptr = readdir(dir)) != NULL) {
+        if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0)  ///current dir OR parrent dir
+            continue;
+        else if (ptr->d_type == 8)  ///file
+            printf("d_name:%s/%s\n", MOUNT_POINT, ptr->d_name);
+        else if (ptr->d_type == 10)  ///link file
+            printf("d_name:%s/%s\n", MOUNT_POINT, ptr->d_name);
+        else if (ptr->d_type == 4)  ///dir
+        {
+            printf("d_name:%s/%s\n", MOUNT_POINT, ptr->d_name);
+        }
+    }
+    closedir(dir);
+
+    if (stat(need_update_file, &info) == 0) {
         USER_ESP_LOGI(PROJECT_NAME, "need up date\n");
         unlink(need_update_file);
         sdcard_ota();
@@ -271,16 +279,47 @@ void app_main(void) {
     sdcard_deinit();
 
     gpio_pad_select_gpio(BUILTIN_LED);
+    gpio_set_level(BUILTIN_LED, 1);
     /* Set the GPIO as a push/pull output */
     gpio_set_direction(BUILTIN_LED, GPIO_MODE_OUTPUT);
     while (1) {
         /* Blink off (output low) */
-        USER_ESP_LOGI(PROJECT_NAME, "Turning off the LED\n");
-        gpio_set_level(BUILTIN_LED, 0);
+        USER_ESP_LOGI(PROJECT_NAME, ".\n");
+        // gpio_set_level(BUILTIN_LED, 0);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
         /* Blink on (output high) */
-        USER_ESP_LOGI(PROJECT_NAME, "Turning on the LED\n");
-        gpio_set_level(BUILTIN_LED, 1);
+        USER_ESP_LOGI(PROJECT_NAME, "-\n");
+        // gpio_set_level(BUILTIN_LED, 1);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+}
+
+void readFileList(const char* basePath) {
+    DIR* dir;
+    struct dirent* ptr;
+    char base[128];
+
+    dir = opendir(basePath);
+    if (dir == NULL) {
+        printf("Open dir:%s error...", basePath);
+        return;
+    }
+
+    while ((ptr = readdir(dir)) != NULL) {
+        if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0)  ///current dir OR parrent dir
+            continue;
+        else if (ptr->d_type == 8)  ///file
+            printf("d_name:%s/%s\n", basePath, ptr->d_name);
+        else if (ptr->d_type == 10)  ///link file
+            printf("d_name:%s/%s\n", basePath, ptr->d_name);
+        else if (ptr->d_type == 4)  ///dir
+        {
+            memset(base, '\0', sizeof(base));
+            strcpy(base, basePath);
+            strcat(base, "/");
+            strcat(base, ptr->d_name);
+            readFileList(base);
+        }
+    }
+    closedir(dir);
 }
